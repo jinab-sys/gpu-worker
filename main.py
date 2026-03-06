@@ -11,6 +11,8 @@ Environment:
     SUPABASE_URL=https://xxx.supabase.co
     SUPABASE_KEY=your-key
     MODELS_DIR=/mnt/models
+    LOAD_IMAGE_MODEL=true   # set false on video-only worker
+    LOAD_VIDEO_MODEL=true   # set false on image-only worker
 """
 
 import os
@@ -44,6 +46,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# ─── Feature flags ────────────────────────────────────────────────────────────
+
+LOAD_IMAGE_MODEL = os.getenv("LOAD_IMAGE_MODEL", "true").lower() == "true"
+LOAD_VIDEO_MODEL = os.getenv("LOAD_VIDEO_MODEL", "true").lower() == "true"
+
 # ─── Global state ─────────────────────────────────────────────────────────────
 
 image_pipe = ImagePipeline()
@@ -65,18 +72,31 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Redis unavailable ({e}), using in-memory jobs only")
         redis_client = None
 
-    # Load models
+    # Load models based on feature flags
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    logger.info("Loading models...")
-    image_pipe.load()
-    video_pipe.load()
+    logger.info(f"Loading models (image={LOAD_IMAGE_MODEL}, video={LOAD_VIDEO_MODEL})...")
+
+    if LOAD_IMAGE_MODEL:
+        image_pipe.load()
+        logger.info("Image model loaded")
+    else:
+        logger.info("Image model skipped (LOAD_IMAGE_MODEL=false)")
+
+    if LOAD_VIDEO_MODEL:
+        video_pipe.load()
+        logger.info("Video model loaded")
+    else:
+        logger.info("Video model skipped (LOAD_VIDEO_MODEL=false)")
+
     logger.info("All models loaded. Server ready.")
 
     yield
 
     # Cleanup
-    image_pipe.unload()
-    video_pipe.unload()
+    if LOAD_IMAGE_MODEL:
+        image_pipe.unload()
+    if LOAD_VIDEO_MODEL:
+        video_pipe.unload()
     if redis_client:
         await redis_client.close()
     logger.info("Shutdown complete")
@@ -105,7 +125,6 @@ class ImageEditRequest(BaseModel):
     steps: int = Field(default=config.DEFAULT_IMAGE_STEPS, ge=1, le=50)
     guidance_scale: float = Field(default=config.DEFAULT_IMAGE_CFG, ge=0.0, le=20.0)
     seed: Optional[int] = Field(default=None)
-    # Output
     output_bucket: str = Field(default=config.DEFAULT_BUCKET)
     output_path: Optional[str] = Field(default=None, description="Path in bucket")
     webhook_url: Optional[str] = Field(default=None)
@@ -234,6 +253,17 @@ async def save_job_to_redis(job_id: str):
         await redis_client.expire(f"job:{job_id}", 86400)  # 24h TTL
 
 
+# ─── Guard helpers ────────────────────────────────────────────────────────────
+
+def _require_image():
+    if not LOAD_IMAGE_MODEL:
+        raise HTTPException(503, "Image model not loaded on this worker (LOAD_IMAGE_MODEL=false). Call the image worker on port 8000.")
+
+def _require_video():
+    if not LOAD_VIDEO_MODEL:
+        raise HTTPException(503, "Video model not loaded on this worker (LOAD_VIDEO_MODEL=false). Call the video worker on port 8001.")
+
+
 # ─── Background task runners ─────────────────────────────────────────────────
 
 async def _run_image_edit(job_id: str, req: ImageEditRequest):
@@ -245,13 +275,11 @@ async def _run_image_edit(job_id: str, req: ImageEditRequest):
         start = time.time()
         seed = req.seed if req.seed is not None else random.randint(0, 2**53)
 
-        # Download reference image
         ref_path = download_file_sync(req.reference_image_url, suffix=".jpg")
         temp_files.append(ref_path)
         from PIL import Image
         ref_image = Image.open(ref_path).convert("RGB")
 
-        # Generate
         local_path = os.path.join(
             config.OUTPUT_DIR,
             generate_output_filename("img_edit", "png"),
@@ -268,7 +296,6 @@ async def _run_image_edit(job_id: str, req: ImageEditRequest):
             output_path=local_path,
         )
 
-        # Upload to Supabase
         remote_path = req.output_path or f"images/{os.path.basename(local_path)}"
         result_url = upload_to_supabase(local_path, req.output_bucket, remote_path)
 
@@ -284,7 +311,6 @@ async def _run_image_edit(job_id: str, req: ImageEditRequest):
         )
         await save_job_to_redis(job_id)
 
-        # Webhook
         if req.webhook_url:
             await fire_webhook(req.webhook_url, jobs[job_id])
 
@@ -360,7 +386,6 @@ async def _run_video_i2v(job_id: str, req: VideoI2VRequest):
         start = time.time()
         seed = req.seed if req.seed is not None else random.randint(0, 2**53)
 
-        # Download starting frame
         img_path = download_file_sync(req.image_url, suffix=".png")
         temp_files.append(img_path)
         from PIL import Image
@@ -478,16 +503,13 @@ async def _run_video_pose(job_id: str, req: VideoPoseRequest):
         start = time.time()
         seed = req.seed if req.seed is not None else random.randint(0, 2**53)
 
-        # Lazy-load pose pipeline (heavy, only when needed)
         from pipelines.pose_pipe import PosePipeline
         pose_pipe = PosePipeline()
         pose_pipe.load()
 
-        # Download reference video
         ref_video_path = download_file_sync(req.reference_video_url, suffix=".mp4")
         temp_files.append(ref_video_path)
 
-        # Download subject image if provided
         subject_image = None
         if req.subject_image_url:
             from PIL import Image
@@ -515,7 +537,6 @@ async def _run_video_pose(job_id: str, req: VideoPoseRequest):
             output_path=local_path,
         )
 
-        # Unload pose pipeline to free VRAM
         pose_pipe.unload()
 
         remote_path = req.output_path or f"videos/{os.path.basename(local_path)}"
@@ -559,7 +580,6 @@ async def _run_video_extend(job_id: str, req: VideoExtendRequest):
 
         from pipelines.extend_pipe import extend_video
 
-        # Download source video
         src_path = download_file_sync(req.video_url, suffix=".mp4")
         temp_files.append(src_path)
 
@@ -614,13 +634,12 @@ async def _run_video_extend(job_id: str, req: VideoExtendRequest):
 
 @app.get("/health")
 async def health():
-    """GPU status, model status, queue depth."""
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
     return {
         "status": "healthy",
         "worker_id": config.WORKER_ID,
         "gpu": gpu_name,
-        "vram_total_gb": round(torch.cuda.get_device_properties(0).total_mem / 1e9, 1),
+        "vram_total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1),
         "vram_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 1),
         "image_model": config.IMAGE_MODEL_ID if image_pipe.is_loaded else "not loaded",
         "video_model": config.VIDEO_MODEL_ID if video_pipe.is_loaded else "not loaded",
@@ -633,7 +652,7 @@ async def health():
 
 @app.post("/image/edit", response_model=JobResponse)
 async def image_edit(req: ImageEditRequest):
-    """Generate image from reference face/image + prompt."""
+    _require_image()
     job_id = create_job("image_edit")
     asyncio.create_task(_run_image_edit(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="Image edit job queued")
@@ -641,7 +660,7 @@ async def image_edit(req: ImageEditRequest):
 
 @app.post("/image/generate", response_model=JobResponse)
 async def image_generate(req: ImageGenerateRequest):
-    """Text-to-image, no reference."""
+    _require_image()
     job_id = create_job("image_generate")
     asyncio.create_task(_run_image_generate(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="Image generation queued")
@@ -651,7 +670,7 @@ async def image_generate(req: ImageGenerateRequest):
 
 @app.post("/video/i2v", response_model=JobResponse)
 async def video_i2v(req: VideoI2VRequest):
-    """Image-to-video. Provide starting frame + motion prompt."""
+    _require_video()
     job_id = create_job("video_i2v")
     asyncio.create_task(_run_video_i2v(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="I2V job queued")
@@ -659,7 +678,7 @@ async def video_i2v(req: VideoI2VRequest):
 
 @app.post("/video/t2v", response_model=JobResponse)
 async def video_t2v(req: VideoT2VRequest):
-    """Text-to-video, no starting image."""
+    _require_video()
     job_id = create_job("video_t2v")
     asyncio.create_task(_run_video_t2v(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="T2V job queued")
@@ -667,7 +686,7 @@ async def video_t2v(req: VideoT2VRequest):
 
 @app.post("/video/pose", response_model=JobResponse)
 async def video_pose(req: VideoPoseRequest):
-    """Pose/motion transfer from reference video to new subject."""
+    _require_video()
     job_id = create_job("video_pose")
     asyncio.create_task(_run_video_pose(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="Pose transfer queued")
@@ -675,7 +694,7 @@ async def video_pose(req: VideoPoseRequest):
 
 @app.post("/video/extend", response_model=JobResponse)
 async def video_extend(req: VideoExtendRequest):
-    """Extend an existing video by generating a continuation."""
+    _require_video()
     job_id = create_job("video_extend")
     asyncio.create_task(_run_video_extend(job_id, req))
     return JobResponse(job_id=job_id, status="queued", message="Video extend queued")
@@ -685,17 +704,12 @@ async def video_extend(req: VideoExtendRequest):
 
 @app.get("/job/{job_id}")
 async def get_job(job_id: str):
-    """Check job status and get result URL."""
-    # Check in-memory first
     if job_id in jobs:
         return jobs[job_id]
-
-    # Check Redis
     if redis_client:
         data = await redis_client.hgetall(f"job:{job_id}")
         if data:
             return data
-
     raise HTTPException(404, "Job not found")
 
 
@@ -705,7 +719,6 @@ async def list_jobs(
     job_type: Optional[str] = None,
     limit: int = 50,
 ):
-    """List jobs with optional filters."""
     result = list(jobs.values())
     if status:
         result = [j for j in result if j.get("status") == status]
@@ -718,7 +731,6 @@ async def list_jobs(
 
 @app.post("/admin/reload")
 async def reload_model(req: ModelReloadRequest):
-    """Hot-reload a model (e.g., upgrade from LTX-2 to LTX-2.3)."""
     if req.model == "image":
         image_pipe.unload()
         if req.model_id:
